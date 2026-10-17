@@ -144,7 +144,6 @@ export class WebhookSubscriptionService {
         statusCode,
       };
     } catch (err) {
-      console.log('PING DEBUG:', err instanceof Error ? err.message : String(err), '| env=', process.env.NODE_TLS_REJECT_UNAUTHORIZED);
       this.logger.warn(
         `Ping to subscription ${id} failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -169,7 +168,7 @@ export class WebhookSubscriptionService {
 
       const req = transport.request(
         url,
-        { method: 'POST', headers, rejectUnauthorized: false },
+        { method: 'POST', headers },
         res => {
           res.resume(); // drain the body so the socket can close cleanly
           resolve(res.statusCode ?? 0);

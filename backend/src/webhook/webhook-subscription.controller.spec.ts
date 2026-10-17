@@ -227,16 +227,12 @@ describe('WebhookSubscriptionController (e2e)', () => {
       expect(response.body.every((s: any) => s.dappId === DAPP_ID)).toBe(true);
     });
 
-    it('filters by the dappId query param when provided', async () => {
+    it('returns 403 when a caller-supplied dappId does not match the JWT sub', async () => {
       await createSubscription({ dappId: DAPP_ID, url: 'https://a.example.com/hook', topics: ['*'] });
-      await createSubscription({ dappId: OTHER_DAPP_ID, url: 'https://c.example.com/hook', topics: ['*'] });
 
-      const response = await request(app.getHttpServer())
+      await request(app.getHttpServer())
         .get(`/webhooks/subscriptions?dappId=${OTHER_DAPP_ID}`)
-        .expect(200);
-
-      expect(response.body).toHaveLength(1);
-      expect(response.body[0].dappId).toBe(OTHER_DAPP_ID);
+        .expect(403);
     });
 
     it('returns an empty list when the dApp has no subscriptions', async () => {
@@ -449,6 +445,118 @@ describe('WebhookSubscriptionController (e2e)', () => {
       await request(app.getHttpServer())
         .post('/webhooks/subscriptions/00000000-0000-0000-0000-000000000000/ping')
         .expect(404);
+    });
+
+    it('returns reachable=false when the endpoint presents an invalid TLS certificate', async () => {
+      // Temporarily re-enable TLS verification for this test only by removing
+      // the process-wide bypass that the rest of the suite relies on.
+      // This proves post() no longer passes rejectUnauthorized: false.
+      const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+      delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+
+      try {
+        // hookUrl uses a self-signed cert — without the bypass it should be rejected.
+        const service = app.get(WebhookSubscriptionService);
+        const sub = await service.create({
+          dappId: DAPP_ID,
+          url: hookUrl,
+          topics: ['*'],
+        });
+
+        const result = await service.ping(sub.id);
+        expect(result.reachable).toBe(false);
+        expect(result.statusCode).toBeUndefined();
+      } finally {
+        // Restore so subsequent tests keep working with the self-signed cert.
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = prev;
+      }
+    });
+  });
+
+  // ── Ownership enforcement (cross-dApp access) ─────────────────────────────
+
+  describe('cross-dApp ownership enforcement', () => {
+    /**
+     * Creates a subscription directly via the service under OTHER_DAPP_ID,
+     * bypassing the controller so we can set up a subscription the authenticated
+     * caller (DAPP_ID) does not own.
+     */
+    let otherSubId: string;
+    let service: WebhookSubscriptionService;
+
+    beforeEach(async () => {
+      service = app.get(WebhookSubscriptionService);
+      const sub = await service.create({
+        dappId: OTHER_DAPP_ID,
+        url: 'https://other.example.com/hook',
+        topics: ['*'],
+        secret: 'other-dapp-secret-value',
+      });
+      otherSubId = sub.id;
+    });
+
+    it('create() ignores a caller-supplied dappId and uses the JWT sub instead', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/webhooks/subscriptions')
+        .send({ dappId: OTHER_DAPP_ID, url: 'https://dapp.example.com/hook', topics: ['*'] })
+        .expect(201);
+
+      // The stored dappId must be the JWT sub, not the one in the body.
+      expect(response.body.dappId).toBe(DAPP_ID);
+    });
+
+    it('findAll() returns 403 when dappId query param belongs to another dApp', async () => {
+      await request(app.getHttpServer())
+        .get(`/webhooks/subscriptions?dappId=${OTHER_DAPP_ID}`)
+        .expect(403);
+    });
+
+    it('findAll() with own dappId query param works normally', async () => {
+      await createSubscription({ dappId: DAPP_ID, url: 'https://a.example.com/hook', topics: ['*'] });
+      const response = await request(app.getHttpServer())
+        .get(`/webhooks/subscriptions?dappId=${DAPP_ID}`)
+        .expect(200);
+      expect(response.body.every((s: any) => s.dappId === DAPP_ID)).toBe(true);
+    });
+
+    it('findOne() returns 403 for a subscription owned by another dApp', async () => {
+      await request(app.getHttpServer())
+        .get(`/webhooks/subscriptions/${otherSubId}`)
+        .expect(403);
+    });
+
+    it('update() returns 403 for a subscription owned by another dApp', async () => {
+      await request(app.getHttpServer())
+        .patch(`/webhooks/subscriptions/${otherSubId}`)
+        .send({ topics: ['escrow.created'] })
+        .expect(403);
+    });
+
+    it('update() returns 403 when trying to reassign dappId to a different value', async () => {
+      const own = await createSubscription({
+        dappId: DAPP_ID,
+        url: 'https://dapp.example.com/hook',
+        topics: ['*'],
+      });
+      await request(app.getHttpServer())
+        .patch(`/webhooks/subscriptions/${own.id}`)
+        .send({ dappId: OTHER_DAPP_ID })
+        .expect(403);
+    });
+
+    it('remove() returns 403 for a subscription owned by another dApp', async () => {
+      await request(app.getHttpServer())
+        .delete(`/webhooks/subscriptions/${otherSubId}`)
+        .expect(403);
+
+      // Subscription must still exist after the failed attempt.
+      expect(service.getById(otherSubId)).toBeDefined();
+    });
+
+    it('ping() returns 403 for a subscription owned by another dApp', async () => {
+      await request(app.getHttpServer())
+        .post(`/webhooks/subscriptions/${otherSubId}/ping`)
+        .expect(403);
     });
   });
 });

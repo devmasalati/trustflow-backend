@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -96,7 +97,10 @@ export class WebhookSubscriptionController {
   @ApiResponse({ status: 201, type: WebhookSubscriptionResponseDto })
   @ApiResponse({ status: 400, description: 'Invalid dappId, URL, topics, or secret' })
   @ApiResponse({ status: 401, description: 'Missing or invalid JWT' })
-  async create(@Body() body: unknown): Promise<WebhookSubscriptionResponseDto> {
+  async create(
+    @Body() body: unknown,
+    @Req() req: Request & { user: { sub: string } },
+  ): Promise<WebhookSubscriptionResponseDto> {
     let parsed;
     try {
       parsed = CreateWebhookSubscriptionSchema.parse(body);
@@ -108,7 +112,8 @@ export class WebhookSubscriptionController {
       }
       throw err;
     }
-    const sub = await this.subscriptionService.create(parsed);
+    // Force dappId to the authenticated caller — never trust the request body.
+    const sub = await this.subscriptionService.create({ ...parsed, dappId: req.user.sub });
     return this.toResponseDto(sub);
   }
 
@@ -132,8 +137,12 @@ export class WebhookSubscriptionController {
     @Query('dappId') dappId: string | undefined,
     @Req() req: Request & { user: { sub: string } },
   ): Promise<WebhookSubscriptionResponseDto[]> {
-    const targetDappId = dappId?.trim() || req.user.sub;
-    const subs = this.subscriptionService.listByDapp(targetDappId);
+    const callerDappId = req.user.sub;
+    // Reject attempts to list another dApp's subscriptions.
+    if (dappId && dappId.trim() !== callerDappId) {
+      throw new ForbiddenException('You can only list your own webhook subscriptions');
+    }
+    const subs = this.subscriptionService.listByDapp(callerDappId);
     return subs.map(s => this.toResponseDto(s));
   }
 
@@ -145,10 +154,16 @@ export class WebhookSubscriptionController {
   @ApiOkResponse({ type: WebhookSubscriptionResponseDto })
   @ApiResponse({ status: 401, description: 'Missing or invalid JWT' })
   @ApiResponse({ status: 404, description: 'Subscription not found' })
-  async findOne(@Param('id') id: string): Promise<WebhookSubscriptionResponseDto> {
+  async findOne(
+    @Param('id') id: string,
+    @Req() req: Request & { user: { sub: string } },
+  ): Promise<WebhookSubscriptionResponseDto> {
     const sub = this.subscriptionService.getById(id);
     if (!sub) {
       throw new NotFoundException(`Webhook subscription ${id} not found`);
+    }
+    if (sub.dappId !== req.user.sub) {
+      throw new ForbiddenException('You do not own this webhook subscription');
     }
     return this.toResponseDto(sub);
   }
@@ -182,9 +197,21 @@ export class WebhookSubscriptionController {
   async update(
     @Param('id') id: string,
     @Body() body: unknown,
+    @Req() req: Request & { user: { sub: string } },
   ): Promise<WebhookSubscriptionResponseDto> {
+    const existing = this.subscriptionService.getById(id);
+    if (!existing) {
+      throw new NotFoundException(`Webhook subscription ${id} not found`);
+    }
+    if (existing.dappId !== req.user.sub) {
+      throw new ForbiddenException('You do not own this webhook subscription');
+    }
     try {
       const parsed = UpdateWebhookSubscriptionSchema.parse(body);
+      // Prevent reassigning a subscription to a different dApp.
+      if (parsed.dappId !== undefined && parsed.dappId !== req.user.sub) {
+        throw new ForbiddenException('Cannot reassign a subscription to a different dApp');
+      }
       const sub = await this.subscriptionService.update(id, parsed);
       return this.toResponseDto(sub);
     } catch (err) {
@@ -215,11 +242,18 @@ export class WebhookSubscriptionController {
   })
   @ApiResponse({ status: 401, description: 'Missing or invalid JWT' })
   @ApiResponse({ status: 404, description: 'Subscription not found' })
-  async remove(@Param('id') id: string): Promise<{ deleted: boolean; id: string }> {
-    const removed = this.subscriptionService.remove(id);
-    if (!removed) {
+  async remove(
+    @Param('id') id: string,
+    @Req() req: Request & { user: { sub: string } },
+  ): Promise<{ deleted: boolean; id: string }> {
+    const existing = this.subscriptionService.getById(id);
+    if (!existing) {
       throw new NotFoundException(`Webhook subscription ${id} not found`);
     }
+    if (existing.dappId !== req.user.sub) {
+      throw new ForbiddenException('You do not own this webhook subscription');
+    }
+    this.subscriptionService.remove(id);
     return { deleted: true, id };
   }
 
@@ -256,7 +290,17 @@ export class WebhookSubscriptionController {
   })
   @ApiResponse({ status: 401, description: 'Missing or invalid JWT' })
   @ApiResponse({ status: 404, description: 'Subscription not found' })
-  async ping(@Param('id') id: string): Promise<WebhookSubscriptionPingResult> {
+  async ping(
+    @Param('id') id: string,
+    @Req() req: Request & { user: { sub: string } },
+  ): Promise<WebhookSubscriptionPingResult> {
+    const existing = this.subscriptionService.getById(id);
+    if (!existing) {
+      throw new NotFoundException(`Webhook subscription ${id} not found`);
+    }
+    if (existing.dappId !== req.user.sub) {
+      throw new ForbiddenException('You do not own this webhook subscription');
+    }
     return this.subscriptionService.ping(id);
   }
 

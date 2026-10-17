@@ -28,13 +28,15 @@ export class IsValidStellarContractConstraint implements ValidatorConstraintInte
 }
 
 export function IsValidStellarContract(validationOptions?: ValidationOptions) {
-  return registerDecorator({
-    target: Object.prototype,
-    propertyName: undefined as any,
-    options: validationOptions,
-    constraints: [],
-    validator: IsValidStellarContractConstraint,
-  });
+  return function (object: object, propertyName: string) {
+    registerDecorator({
+      target: object.constructor,
+      propertyName,
+      options: validationOptions,
+      constraints: [],
+      validator: IsValidStellarContractConstraint,
+    });
+  };
 }
 
 export class StartPollingDto {

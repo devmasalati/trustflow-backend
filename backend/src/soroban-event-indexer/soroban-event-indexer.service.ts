@@ -1,4 +1,4 @@
-import { Inject, Injectable, OnModuleDestroy, OnModuleInit, BeforeApplicationShutdown } from '@nestjs/common';
+import { Inject, Injectable, OnModuleDestroy, OnModuleInit, BeforeApplicationShutdown, Optional } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import { rpc as SorobanRpc } from '@stellar/stellar-sdk';
 import { Redis } from 'ioredis';
