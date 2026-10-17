@@ -130,15 +130,52 @@ describe('IpfsPinningService', () => {
   });
 
   describe('reconcile', () => {
-    it('detects a lost pin and fails explicitly when no original content is retained for retry', async () => {
+    it('detects a lost pin and dispatches PIN_DEGRADED when no original content is retained for retry', async () => {
       await service.pinContent({ content: CONTENT }); // pinned to pinata + web3Storage
 
       pinata.verify.mockResolvedValue(false); // pinata silently lost the pin
-      await expect(service.reconcile(CID)).rejects.toThrow('original content is no longer retained');
+
+      const record = await service.reconcile(CID);
+
+      // PIN_LOST fired for the provider that dropped the pin
       expect(webhookService.dispatch).toHaveBeenCalledWith(
         IPFS_EVENTS.PIN_LOST,
         expect.objectContaining({ cid: CID, provider: PinProviderName.PINATA }),
       );
+
+      // PIN_DEGRADED fired because healthy count < replicationFactor and content is gone
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        IPFS_EVENTS.PIN_DEGRADED,
+        expect.objectContaining({ cid: CID, reason: 'content-not-retained' }),
+      );
+
+      // No re-pin attempted — content is not retained
+      expect(infura.pin).not.toHaveBeenCalled();
+      expect(record.status).toBe(PinStatus.DEGRADED);
+    });
+
+    it('dispatches PIN_DEGRADED when a DEGRADED record is reconciled without retained content', async () => {
+      // Pin to only one provider (degraded from the start)
+      pinata.pin.mockResolvedValue(undefined);
+      web3Storage.pin.mockRejectedValue(new Error('web3storage down'));
+      infura.pin.mockRejectedValue(new Error('infura down'));
+
+      await service.pinContent({ content: CONTENT });
+      jest.clearAllMocks();
+      webhookService.dispatch.mockResolvedValue(undefined);
+
+      // All providers pass verify (no new loss) but record is already DEGRADED
+      pinata.verify.mockResolvedValue(true);
+
+      const record = await service.reconcile(CID);
+
+      expect(record.status).toBe(PinStatus.DEGRADED);
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        IPFS_EVENTS.PIN_DEGRADED,
+        expect.objectContaining({ cid: CID, reason: 'content-not-retained' }),
+      );
+      // No top-up attempted
+      expect(web3Storage.pin).not.toHaveBeenCalled();
       expect(infura.pin).not.toHaveBeenCalled();
     });
 

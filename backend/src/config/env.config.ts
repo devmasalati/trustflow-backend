@@ -251,6 +251,7 @@ const EnvSchema = z
     WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
     WEBHOOK_RELAY_BATCH_SIZE: z.coerce.number().int().positive().default(50),
     WEBHOOK_RELAY_LEASE_MS: z.coerce.number().int().positive().default(30_000),
+    WEBHOOK_PROCESSOR_CONCURRENCY: z.coerce.number().int().positive().default(10),
     OUTBOX_RELAY_INTERVAL_MS: z.coerce.number().int().nonnegative().default(1000),
     OUTBOX_RELAY_BATCH_SIZE: z.coerce.number().int().positive().default(100),
     OUTBOX_RELAY_LEASE_MS: z.coerce.number().int().positive().default(30_000),
@@ -276,6 +277,32 @@ const EnvSchema = z
     IPFS_REPIN_SWEEP_CONCURRENCY: z.coerce.number().int().positive().default(8),
     IPFS_REPIN_INTERVAL_MS: optionalNonnegativeInt(),
     IPFS_PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+
+    // S3-compatible Storage Configuration (avatar uploads)
+    S3_BUCKET: z.preprocess(blankToUndefined, z.string().optional()).describe(
+      'S3 bucket name for avatar uploads. Required in production.',
+    ),
+    S3_REGION: z.preprocess(blankToUndefined, z.string().optional()).describe(
+      'AWS region (or equivalent) for the S3 bucket.',
+    ),
+    S3_ACCESS_KEY_ID: z.preprocess(blankToUndefined, z.string().optional()).describe(
+      'AWS / S3-compatible access key ID.',
+    ),
+    S3_SECRET_ACCESS_KEY: z.preprocess(blankToUndefined, z.string().optional()).describe(
+      'AWS / S3-compatible secret access key.',
+    ),
+    S3_ENDPOINT: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe(
+        'Custom S3-compatible endpoint URL (e.g. MinIO, Cloudflare R2). ' +
+          'Leave unset to use the standard AWS endpoint.',
+      ),
+    S3_PUBLIC_URL_BASE: z
+      .preprocess(blankToUndefined, z.string().url().optional())
+      .describe(
+        'Base URL for public object access (e.g. CDN prefix). ' +
+          'When set, returned avatar URLs use this prefix instead of the signed URL.',
+      ),
 
     // Arweave Configuration
     ARWEAVE_JWT: z.string().optional().describe('Arweave wallet key in JWK format'),

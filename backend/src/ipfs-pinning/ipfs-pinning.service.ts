@@ -349,17 +349,25 @@ export class IpfsPinningService implements OnModuleInit {
       }
     }
 
-    // Never top up replication for a pin the caller asked to remove.
-// Content is not retained after initial pin, so replicate will be called with undefined.
-    const buffer = undefined;
-    if (this.countHealthy(record) < record.replicationFactor && buffer) {
-      await this.replicate(record, buffer).catch(error => {
-        this.logger.warn(
-          `Reconcile: unable to restore full replication for ${cid}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        throw error;
+    // Content is not retained after initial pin, so top-up replication is not possible
+    // from reconcile(). When the healthy count falls below the replication factor, surface
+    // this explicitly instead of silently re-persisting the same DEGRADED status.
+    if (this.countHealthy(record) < record.replicationFactor) {
+      this.finalizeStatus(record);
+      record.updatedAt = new Date().toISOString();
+      await this.persist(record);
+
+      this.logger.warn(
+        `Reconcile: ${cid} is below replication factor ` +
+          `(${this.countHealthy(record)}/${record.replicationFactor} healthy) ` +
+          `and original content is not retained — re-upload required to restore full replication.`,
+      );
+
+      await this.webhookService.dispatch(IPFS_EVENTS.PIN_DEGRADED, {
+        cid,
+        healthyProviders: this.countHealthy(record),
+        replicationFactor: record.replicationFactor,
+        reason: 'content-not-retained',
       });
     } else {
       this.finalizeStatus(record);

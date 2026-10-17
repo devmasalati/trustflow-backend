@@ -2,9 +2,193 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { OutboxService } from './outbox.service';
 import { OutboxEventState, OutboxEventType } from './outbox.entity';
 
-describe('OutboxService', () => {
-  let service: OutboxService;
+// OutboxService reads config.OUTBOX_MAX_ATTEMPTS via the Proxy, which calls
+// getConfig() / validateEnv() the first time. Ensure the env is valid before tests run.
+import { validateEnv, resetEnvConfig } from '../config/env.config';
+validateEnv();
 
+function makeService(): OutboxService {
+  return new OutboxService(null, undefined);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Core Redis-backed API — exercised against the in-memory fallback
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('OutboxService — core API (in-memory fallback)', () => {
+  let service: OutboxService;
+  beforeEach(() => {
+    service = makeService();
+  });
+
+  describe('create + append + findById', () => {
+    it('creates an event with status pending and persists it', async () => {
+      const event = service.create('gig.created', 'gig', 'gig-1', { id: 'gig-1' });
+      expect(event.status).toBe('pending');
+      expect(event.attempts).toBe(0);
+      expect(event.id).toBeDefined();
+
+      await service.append(event);
+      const found = await service.findById(event.id);
+      expect(found).toEqual(event);
+    });
+  });
+
+  describe('claimDue', () => {
+    it('claims a due event and returns it', async () => {
+      const event = service.create('gig.created', 'gig', 'gig-1', {});
+      await service.append(event);
+
+      const claimed = await service.claimDue(Date.now(), 30_000, 10);
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0].id).toBe(event.id);
+    });
+
+    it('does not claim a future-scheduled event', async () => {
+      const event = service.create('gig.created', 'gig', 'gig-1', {});
+      event.nextAttemptAt = Date.now() + 60_000;
+      await service.append(event);
+
+      const claimed = await service.claimDue(Date.now(), 30_000, 10);
+      expect(claimed).toHaveLength(0);
+    });
+
+    it('respects batchSize', async () => {
+      for (let i = 0; i < 5; i++) {
+        await service.append(service.create('t', 'x', `id-${i}`, {}));
+      }
+      const claimed = await service.claimDue(Date.now(), 30_000, 3);
+      expect(claimed).toHaveLength(3);
+    });
+  });
+
+  describe('reclaimExpired', () => {
+    it('moves processing items back to pending so they can be re-claimed', async () => {
+      const event = service.create('t', 'x', 'id-1', {});
+      await service.append(event);
+      await service.claimDue(Date.now(), 30_000, 1);
+
+      const reclaimed = await service.reclaimExpired(Date.now() + 999, 10);
+      expect(reclaimed).toHaveLength(1);
+
+      const claimed2 = await service.claimDue(Date.now() + 999, 30_000, 10);
+      expect(claimed2[0].id).toBe(event.id);
+    });
+  });
+
+  describe('markDelivered', () => {
+    it('marks a claimed event as delivered with a deliveredAt timestamp', async () => {
+      const event = service.create('t', 'x', 'id-1', {});
+      await service.append(event);
+      const [claimed] = await service.claimDue(Date.now(), 30_000, 1);
+
+      await service.markDelivered(claimed);
+
+      const found = await service.findById(event.id);
+      expect(found?.status).toBe('delivered');
+      expect(found?.deliveredAt).toBeDefined();
+    });
+  });
+
+  describe('retry', () => {
+    it('reschedules a failed event with incremented attempts and retrying status', async () => {
+      const event = service.create('t', 'x', 'id-1', {});
+      await service.append(event);
+      const [claimed] = await service.claimDue(Date.now(), 30_000, 1);
+
+      await service.retry(claimed, new Error('oops'));
+
+      const found = await service.findById(event.id);
+      expect(found?.attempts).toBe(1);
+      expect(found?.status).toBe('retrying');
+      expect(found?.lastError).toBe('oops');
+    });
+
+    it('marks an event permanently failed at OUTBOX_MAX_ATTEMPTS', async () => {
+      const previous = process.env.OUTBOX_MAX_ATTEMPTS;
+      process.env.OUTBOX_MAX_ATTEMPTS = '1';
+      resetEnvConfig();
+      validateEnv();
+
+      try {
+        const svc = makeService();
+        const event = svc.create('t', 'x', 'id-1', {});
+        await svc.append(event);
+        const [claimed] = await svc.claimDue(Date.now(), 30_000, 1);
+
+        await svc.retry(claimed, new Error('poison'));
+
+        const found = await svc.findById(event.id);
+        expect(found?.status).toBe('failed');
+        expect(found?.attempts).toBe(1);
+      } finally {
+        if (previous === undefined) delete process.env.OUTBOX_MAX_ATTEMPTS;
+        else process.env.OUTBOX_MAX_ATTEMPTS = previous;
+        resetEnvConfig();
+        validateEnv();
+      }
+    });
+  });
+
+  describe('appendToTransaction', () => {
+    it('calls set and zadd on the provided transaction object', () => {
+      const tx = { set: jest.fn().mockReturnThis(), zadd: jest.fn().mockReturnThis() };
+      const event = service.create('t', 'x', 'id-1', {});
+
+      service.appendToTransaction(tx as any, event);
+
+      expect(tx.set).toHaveBeenCalledWith(
+        expect.stringContaining(event.id),
+        expect.any(String),
+      );
+      expect(tx.zadd).toHaveBeenCalledWith('outbox:pending', event.nextAttemptAt, event.id);
+    });
+  });
+
+  describe('replayAll', () => {
+    it('resets failed events back to pending and returns succeeded ids', async () => {
+      const previous = process.env.OUTBOX_MAX_ATTEMPTS;
+      process.env.OUTBOX_MAX_ATTEMPTS = '1';
+      resetEnvConfig();
+      validateEnv();
+
+      try {
+        const svc = makeService();
+        const event = svc.create('t', 'x', 'id-1', {});
+        await svc.append(event);
+        const [claimed] = await svc.claimDue(Date.now(), 30_000, 1);
+        await svc.retry(claimed, new Error('poison'));
+
+        const result = await svc.replayAll();
+        expect(result.succeeded).toContain(event.id);
+        expect(result.failed).toHaveLength(0);
+
+        expect((await svc.findById(event.id))?.status).toBe('pending');
+      } finally {
+        if (previous === undefined) delete process.env.OUTBOX_MAX_ATTEMPTS;
+        else process.env.OUTBOX_MAX_ATTEMPTS = previous;
+        resetEnvConfig();
+        validateEnv();
+      }
+    });
+  });
+
+  describe('sendWebhook', () => {
+    it('does not throw synchronously', () => {
+      expect(() =>
+        service.sendWebhook(null, 'ipfs.pin.created', { cid: 'abc' }, 'key-1'),
+      ).not.toThrow();
+    });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Legacy in-memory admin API (createEvent / processEvent / replayEvent)
+// These methods are used by OutboxController and the original unit tests.
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('OutboxService — legacy admin API', () => {
+  let service: OutboxService;
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [OutboxService],
@@ -12,12 +196,8 @@ describe('OutboxService', () => {
     service = module.get<OutboxService>(OutboxService);
   });
 
-  it('should be defined', () => {
-    expect(service).toBeDefined();
-  });
-
   describe('createEvent', () => {
-    it('should create a pending event', async () => {
+    it('creates a PENDING event with the correct defaults', async () => {
       const event = await service.createEvent(
         OutboxEventType.DISPUTE_RAISED,
         '{"escrowId":"esc-123"}',
@@ -30,19 +210,17 @@ describe('OutboxService', () => {
   });
 
   describe('processEvent', () => {
-    it('should deliver a non-failing event', async () => {
+    it('delivers a non-failing event', async () => {
       const event = await service.createEvent(
         OutboxEventType.ESCROW_CREATED,
         '{"shouldFail":false}',
       );
       const result = await service.processEvent(event.id);
       expect(result.success).toBe(true);
-
-      const updated = await service.getEvent(event.id);
-      expect(updated?.state).toBe(OutboxEventState.DELIVERED);
+      expect((await service.getEvent(event.id))?.state).toBe(OutboxEventState.DELIVERED);
     });
 
-    it('should fail events with shouldFail flag', async () => {
+    it('fails events with shouldFail flag', async () => {
       const event = await service.createEvent(
         OutboxEventType.DISPUTE_RAISED,
         '{"shouldFail":true}',
@@ -53,13 +231,11 @@ describe('OutboxService', () => {
   });
 
   describe('dead letter queue', () => {
-    it('should move events to DLQ after max attempts', async () => {
+    it('moves events to DLQ after max attempts', async () => {
       const event = await service.createEvent(
         OutboxEventType.DISPUTE_RAISED,
         '{"shouldFail":true}',
       );
-
-      // Process until dead-lettered (10 attempts)
       for (let i = 0; i < 10; i++) {
         await service.processEvent(event.id);
       }
@@ -73,7 +249,7 @@ describe('OutboxService', () => {
       expect(updated?.deadLetteredAt).toBeDefined();
     });
 
-    it('should not block active queue when events are dead-lettered', async () => {
+    it('does not block active queue when events are dead-lettered', async () => {
       const failEvent = await service.createEvent(
         OutboxEventType.DISPUTE_RAISED,
         '{"shouldFail":true}',
@@ -82,7 +258,6 @@ describe('OutboxService', () => {
         await service.processEvent(failEvent.id);
       }
 
-      // New events should still be processable
       const newEvent = await service.createEvent(
         OutboxEventType.ESCROW_CREATED,
         '{"test":true}',
@@ -93,31 +268,7 @@ describe('OutboxService', () => {
   });
 
   describe('replayEvent', () => {
-    it('should replay a dead-lettered event', async () => {
-      const event = await service.createEvent(
-        OutboxEventType.ESCROW_CREATED,
-        '{"test":"replay"}',
-      );
-
-      // First deliver it normally
-      await service.processEvent(event.id);
-      expect((await service.getEvent(event.id))?.state).toBe(OutboxEventState.DELIVERED);
-
-      // Manually set to dead-letter for testing replay
-      const deadEvent = await service.createEvent(
-        OutboxEventType.DISPUTE_RAISED,
-        '{"shouldFail":true}',
-      );
-      for (let i = 0; i < 10; i++) {
-        await service.processEvent(deadEvent.id);
-      }
-
-      // Now fix the payload and replay
-      const eventToReplay = await service.getEvent(deadEvent.id);
-      expect(eventToReplay?.state).toBe(OutboxEventState.DEAD_LETTER);
-    });
-
-    it('should throw for non-dead-lettered events', async () => {
+    it('throws for non-dead-lettered events', async () => {
       const event = await service.createEvent(
         OutboxEventType.ESCROW_CREATED,
         '{"test":true}',
@@ -127,8 +278,7 @@ describe('OutboxService', () => {
   });
 
   describe('replayAll', () => {
-    it('should replay all dead-lettered events', async () => {
-      // Create and dead-letter two events
+    it('returns succeeded/failed properties', async () => {
       const e1 = await service.createEvent(
         OutboxEventType.DISPUTE_RAISED,
         '{"shouldFail":true}',
@@ -141,7 +291,6 @@ describe('OutboxService', () => {
         await service.processEvent(e1.id);
         await service.processEvent(e2.id);
       }
-
       expect(service.getDeadLetterEvents().length).toBeGreaterThanOrEqual(2);
 
       const result = await service.replayAll();

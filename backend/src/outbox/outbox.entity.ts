@@ -16,15 +16,15 @@ export enum OutboxEventType {
 }
 
 export class OutboxEvent {
-  id: string;
-  eventType: OutboxEventType;
-  payload: string;
-  state: OutboxEventState;
-  attempts: number;
-  maxAttempts: number;
+  id!: string;
+  eventType!: OutboxEventType;
+  payload!: string;
+  state!: OutboxEventState;
+  attempts!: number;
+  maxAttempts!: number;
   lastError?: string;
-  createdAt: Date;
-  updatedAt: Date;
+  createdAt!: Date;
+  updatedAt!: Date;
   processedAt?: Date;
   deadLetteredAt?: Date;
 }

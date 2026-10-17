@@ -92,7 +92,16 @@ export class RepinWorkerService implements OnModuleInit, OnModuleDestroy {
     // isolated and logged, exactly as before.
     await mapWithConcurrency(targets, config.IPFS_REPIN_SWEEP_CONCURRENCY, async record => {
       try {
-        await this.pinningService.reconcile(record.cid);
+        const result = await this.pinningService.reconcile(record.cid);
+        if (
+          result.status === PinStatus.DEGRADED ||
+          result.status === PinStatus.FAILED
+        ) {
+          this.logger.warn(
+            `Re-pin sweep: ${record.cid} remains ${result.status} after reconcile — ` +
+              `original content is not retained; re-upload required to restore full replication.`,
+          );
+        }
       } catch (error) {
         this.logger.warn(
           `Re-pin sweep: could not reconcile ${record.cid}: ${

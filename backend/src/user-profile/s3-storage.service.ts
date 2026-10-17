@@ -1,11 +1,13 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
-import * as https from 'https';
-import * as http from 'http';
+import { config } from '../config/env.config';
 
 export interface UploadResult {
   url: string;
   key: string;
+  /** Present and `true` only when the upload was handled by the no-op placeholder
+   *  (i.e. no real storage provider is configured). Never set in production. */
+  simulated?: true;
 }
 
 export interface StorageProvider {
@@ -19,16 +21,39 @@ export interface StorageProvider {
  *
  * Uses a pluggable StorageProvider so the actual S3 client can be swapped
  * (AWS S3, MinIO, Cloudflare R2, etc.) without changing the rest of the app.
- * When no provider is configured, falls back to a no-op that returns a
- * placeholder URL — useful for local dev and testing.
+ * When no provider is configured in non-production, falls back to a no-op that
+ * returns a placeholder URL with `simulated: true` — useful for local dev and
+ * testing, but never silently in production.
+ *
+ * Production startup guard: if NODE_ENV === 'production' and no provider has been
+ * registered by the time onModuleInit() runs, the application refuses to start
+ * (mirroring the pattern used by IpfsPinningService — see #409).
  */
 @Injectable()
-export class S3StorageService {
+export class S3StorageService implements OnModuleInit {
   private readonly logger = new SanitizedLogger(S3StorageService.name);
   private provider: StorageProvider | null = null;
 
   registerProvider(provider: StorageProvider): void {
     this.provider = provider;
+  }
+
+  onModuleInit(): void {
+    if (!this.provider && config.NODE_ENV === 'production') {
+      throw new Error(
+        'S3StorageService: no storage provider has been registered. ' +
+          'Set S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY ' +
+          'before deploying to production — avatar uploads must not silently return ' +
+          'placeholder URLs in a live environment.',
+      );
+    }
+
+    if (!this.provider) {
+      this.logger.warn(
+        'S3StorageService: no storage provider configured — avatar uploads will return ' +
+          'placeholder URLs (simulated: true). Set S3_* env vars to enable real storage.',
+      );
+    }
   }
 
   async uploadAvatar(
@@ -43,6 +68,7 @@ export class S3StorageService {
       return {
         url: `https://placeholder.trustflow.xyz/avatars/${key}`,
         key,
+        simulated: true,
       };
     }
 
